@@ -1,0 +1,109 @@
+# =========================
+# Global / OS
+# =========================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs / dumps
+logs/
+*.log
+*.err
+*.out
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Env / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Ngrok / tunnels (metadatos locales)
+.ngrok2/
+.ngrok/
+.ngrok.log
+*.ngrok.log
+
+# =========================
+# Docker
+# =========================
+# (mantén docker-compose.yml en repo)
+docker-data/
+.docker/
+**/.dockerignore
+
+# =========================
+# Frontend (Next.js / Vite / React)
+# =========================
+frontend/node_modules/
+frontend/.next/
+frontend/.next-cache/
+frontend/.next/cache/
+frontend/.turbo/
+frontend/.swc/
+frontend/.vercel/
+frontend/.cache/
+frontend/out/
+frontend/dist/
+frontend/build/
+frontend/coverage/
+frontend/.nyc_output/
+frontend/.eslintcache
+
+# Si usas Playwright/Cypress
+frontend/playwright-report/
+frontend/test-results/
+frontend/cypress/videos/
+frontend/cypress/screenshots/
+frontend/cypress/downloads/
+
+# =========================
+# Backend (Python / FastAPI)
+# =========================
+backend/.venv/
+backend/venv/
+backend/env/
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/.ruff_cache/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/*.pyd
+backend/.coverage
+backend/htmlcov/
+backend/.benchmarks/
+
+# Artefactos de build (si compilas wheels, etc.)
+backend/build/
+backend/dist/
+backend/*.egg-info/
+backend/.eggs/
+
+# =========================
+# Editor / IDE
+# =========================
+.vscode/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+.idea/
+*.iml
+
+# =========================
+# Temp / misc
+# =========================
+tmp/
+temp/
+.cache/
+**/.cache/
+uploads/
+media/
