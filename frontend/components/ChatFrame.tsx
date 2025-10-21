@@ -1,41 +1,93 @@
 'use client';
 import { useRef, useState } from "react";
-import { startRealtimeSession, RealtimeEvent } from "./realtime/RealtimeClient";
+import { startRealtimeSession, sendUserText, RealtimeEvent } from "./realtime/RealtimeClient";
 
 type Msg = { role: 'assistant'|'user'|'system', text: string };
 
 export default function ChatFrame(){
   const [messages, setMessages] = useState<Msg[]>([]);
   const [partial, setPartial] = useState<string>("");
-  const [toolCall, setToolCall] = useState<{name:string; args:any} | null>(null);
   const pcRef = useRef<RTCPeerConnection|null>(null);
   const [on, setOn] = useState(false);
 
+  const [pending, setPending] = useState<any|null>(null);   // acción por confirmar
+  const [lastUser, setLastUser] = useState<string>("");     // último texto del usuario
+
+  const [status, setStatus] = useState<'idle' | 'listening' | 'processing' | 'ready'>('idle');
+
+
   function onEvent(e: RealtimeEvent){
-    if (e.kind === "vad") {
-        if (e.state === "started")  setMessages(m => [...m, {role:'system', text:'🎙️ Escuchando...'}]);
-        if (e.state === "stopped")  setMessages(m => [...m, {role:'system', text:'✋ Detecté silencio, procesando...'}]);
-        if (e.state === "committed")setMessages(m => [...m, {role:'system', text:'📦 Audio listo para transcribir'}]);
+    if (e.kind === "raw") {
+      // Para confirmar que realmente llegan los tool_calls
+      try { console.log("[RAW]", typeof e.data === "string" ? e.data : e.data); } catch {}
     }
+    if (e.kind === "vad") {
+      if (e.state === "started")   setStatus('listening');
+      if (e.state === "stopped")   setStatus('processing');
+      if (e.state === "committed") setStatus('processing');
+      return;
+    }
+    if (e.kind === "user_text") {
+      setLastUser(e.text);
+      setMessages([{ role: 'user', text: e.text }]); // mostramos sólo el último comando
+      return;
+    }
+    
+    if (e.kind === "pending_action") {
+      console.log("🔄 Nueva acción pendiente:", e.data);
+      // fuerza render: clona profundo para nueva referencia
+      const next = typeof structuredClone === "function"
+        ? structuredClone(e.data)
+        : JSON.parse(JSON.stringify(e.data));
+
+      // evita bug de no render si es igual
+      setPending((prev) => {
+        if (JSON.stringify(prev) !== JSON.stringify(next)) return next;
+        return prev;
+      });
+      return;
+    }
+
 
     if(e.kind === "partial_text"){
       setPartial((p) => p + e.text); // acumula
-    } else if (e.kind === "final_text"){
-      if (partial) setPartial(""); // limpia el parcial
+    }
+
+    if (e.kind === "final_text") {
+      if (partial) setPartial("");
       setMessages((m) => [...m, { role: 'assistant', text: e.text }]);
-    } else if (e.kind === "tool_call"){
-      setToolCall({ name: e.name, args: e.args });
-    } else if (e.kind === "info"){
-      setMessages((m)=>[...m, {role:'system', text:e.message}]);
-    } else if (e.kind === "error"){
+      return;
+    }
+
+
+    if (e.kind === "info") {
+      if (e.message?.includes("Sesión Realtime conectada")) setStatus('ready');
+      return; // opcional: quita el setMessages si ya no quieres logs en el chat
+    }
+
+    if (e.kind === "error"){
       setMessages((m)=>[...m, {role:'system', text:`❌ ${e.message}`}]);
     }
+    
+    if (e.kind === "action") {
+      setPending(null);               // ahora sí, ya se confirmó y ejecutó
+      setMessages((m)=>[...m, {role:'system', text:'✅ Acción confirmada y enviada al backend'}]);
+      return;
+    }
+
+
+    if (e.kind === "error") {
+      setStatus('ready');
+      setMessages((m)=>[...m, {role:'system', text:`❌ ${e.message}`}]);
+      return;
+    }
+
+
   }
 
   async function toggle(){
     if(!on){
       setPartial("");
-      setToolCall(null);
       pcRef.current = await startRealtimeSession(onEvent);
       setOn(true);
     } else {
@@ -58,11 +110,21 @@ export default function ChatFrame(){
       });
       const data = await r.json();
       setMessages((m)=>[...m, {role:'system', text:`✅ ${name}: ${JSON.stringify(data)}`}]);
-      setToolCall(null);
     }catch(err:any){
       setMessages((m)=>[...m, {role:'system', text:`❌ error en ${name}: ${String(err)}`}]);
     }
   }
+
+  function camposOpcionalesFaltantes(p: any) {
+    const base = [
+      "tipo","precio_unitario","costo_produccion","tiempo_impresion",
+      "stock_alerta","gramos","etiquetas","notas","cliente","productos",
+      "proveedor","precio_total","categoria","fecha","prioridad"
+    ];
+    const params = p?.params || {};
+    return base.filter(k => !(k in params));
+  }
+
 
   return (
     <div className="mx-auto max-w-3xl p-4 grid gap-3">
@@ -71,6 +133,14 @@ export default function ChatFrame(){
           onClick={toggle}
           className={`px-4 py-2 rounded-2xl text-white ${on? 'bg-red-500':'bg-green-600'}`}
         >{on? 'Detener' : 'Hablar'}</button>
+        
+        <span className="text-xl select-none">
+          {status === 'idle'       && '⭕'}   {/* inactivo */}
+          {status === 'listening'  && '🎙️'}  {/* escuchando */}
+          {status === 'processing' && '⏳'}   {/* procesando */}
+          {status === 'ready'      && '✅'}   {/* listo */}
+        </span>
+
         <audio id="assistant-audio" autoPlay playsInline />
       </div>
 
@@ -89,23 +159,53 @@ export default function ChatFrame(){
         )}
       </div>
 
-      {toolCall && (
+      {pending && (
         <div className="rounded-xl border p-3 bg-yellow-50">
-          <div className="font-semibold mb-1">Acción detectada</div>
-          <div className="text-sm">tool: <b>{toolCall.name}</b></div>
-          <pre className="text-xs bg-white rounded p-2 mt-2 overflow-auto">
-{JSON.stringify(toolCall.args, null, 2)}
-          </pre>
+          <div className="font-semibold mb-1">Confirma acción</div>
+
+          <div className="text-sm mb-2">
+            <div><b>Acción:</b> {pending.accion}</div>
+          </div>
+
+          <div className="text-xs mb-1 font-semibold">Parámetros actuales</div>
+          <div className="text-xs bg-white rounded p-2 overflow-auto">
+            <ul className="list-disc pl-5">
+              {Object.entries(pending.params ?? {}).map(([k,v])=>(
+                <li key={k}><b>{k}</b>: {typeof v === 'object' ? JSON.stringify(v) : String(v)}</li>
+              ))}
+              {Object.keys(pending.params ?? {}).length === 0 && <li>(sin parámetros)</li>}
+            </ul>
+          </div>
+
+          <div className="text-xs mt-2">
+            Puedes agregar (opcional):{" "}
+            {(() => {
+              const base = ["tipo","precio_unitario","costo_produccion","tiempo_impresion","stock_alerta","gramos","etiquetas","notas","cliente","productos","proveedor","precio_total","categoria","fecha","prioridad"];
+              const params = pending?.params || {};
+              const faltan = base.filter(k => !(k in params));
+              return faltan.length ? faltan.join(", ") : "—";
+            })()}
+          </div>
+
           <div className="mt-2 flex gap-2">
-            <button className="px-3 py-1 rounded bg-green-600 text-white" onClick={confirmarToolCall}>
+            <button
+              className="px-3 py-1 rounded bg-green-600 text-white"
+              onClick={() => sendUserText("confirmo")}  // <- deja que el backend haga la confirmación real
+            >
               Confirmar
             </button>
-            <button className="px-3 py-1 rounded bg-gray-300" onClick={()=>setToolCall(null)}>
+            <button
+              className="px-3 py-1 rounded bg-gray-300"
+              onClick={() => { sendUserText("cancela"); /* opcional: setPending(null); */ }}
+            >
               Cancelar
             </button>
           </div>
         </div>
       )}
+
+
+
     </div>
   )
 }

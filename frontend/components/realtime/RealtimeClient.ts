@@ -1,5 +1,3 @@
-// ========================= RealtimeClient.ts =========================
-
 export type RealtimeEvent =
   | { kind: "partial_text"; text: string }
   | { kind: "final_text"; text: string }
@@ -57,6 +55,33 @@ function buildConfirmPrompt(a: any): string {
   );
 }
 
+function normalizeUpdates(upd: Record<string, any> = {}) {
+  const out: Record<string, any> = { ...upd };
+
+  const map: Record<string, string> = {
+    nombre: "producto",
+    precio: "precio_unitario",
+    preciounitario: "precio_unitario",
+    costo: "costo_produccion",
+    costo_producción: "costo_produccion",
+    tiempo: "tiempo_impresion",
+    tiempoimpresion: "tiempo_impresion",
+    peso: "gramos",
+    alerta: "stock_alerta",
+    stock: "stock_alerta",
+  };
+
+  for (const k of Object.keys(upd)) {
+    const canon = map[k.replace(/\s|_/g, "").toLowerCase()];
+    if (canon && canon !== k) {
+      out[canon] = upd[k];
+      delete out[k];
+    }
+  }
+  return out;
+}
+
+
 export async function startRealtimeSession(
   onEvent?: (evt: RealtimeEvent) => void
 ): Promise<RTCPeerConnection> {
@@ -83,6 +108,7 @@ export async function startRealtimeSession(
   let activeResponseId: string | null = null;
   let lastCommitAt = 0;
   let pendingAction: any = null;     // <- acción por confirmar
+  let lastUserText = ""; 
 
   // ———————— handler de mensajes ————————
   const handleMsg = (e: MessageEvent) => {
@@ -92,11 +118,19 @@ export async function startRealtimeSession(
     const p = safeParse(e);
     if (!p) return;
 
-    // debug útil
-    if (p.type === "conversation.item.created") log("item.created:", p.item?.content);
+    if (p.type === "conversation.item.created") {
+      const item = p.item;
+      if (item?.role === "user" && Array.isArray(item.content)) {
+        const txt = item.content.find((c:any)=>c?.type==="input_text")?.text
+                || item.content.find((c:any)=>c?.type==="input_audio_transcription")?.text;
+        if (txt) lastUserText = txt;                       // <- NUEVO
+      }
+      log("item.created:", p.item?.content);
+    }
 
     // VAD
     if (p.type === "input_audio_buffer.speech_started") {
+      lastUserText = "";
       onEvent?.({ kind: "vad", state: "started" }); return;
     }
     if (p.type === "input_audio_buffer.speech_stopped") {
@@ -138,49 +172,98 @@ export async function startRealtimeSession(
     if (p.type === "response.output_tool_calls.done" && Array.isArray(p.tool_calls)) {
       for (const tc of p.tool_calls) {
         const name = tc.name || tc.function?.name;
+
         if (name === "emit_action") {
           const argsStr = tc.arguments ?? tc.function?.arguments ?? "{}";
-          let parsed: any = {};
-          try { parsed = JSON.parse(argsStr); } catch {}
+          let parsed: any = {}; try { parsed = JSON.parse(argsStr); } catch {}
           pendingAction = parsed;
 
-          // avisa a la UI que hay algo por confirmar
+          // 👇 AÑADE / VERIFICA ESTA LÍNEA
+          lastUserText = ""; 
           onEvent?.({ kind: "pending_action", data: pendingAction });
 
-          // responde tool_output para cerrar el paso…
           dc.send(JSON.stringify({
             type: "response.tool_output",
             tool_call_id: tc.id,
             output: JSON.stringify({ status: "received" })
           }));
 
-          // …y crea una respuesta pidiendo confirmación
+          const confirmText = buildConfirmPrompt(pendingAction);
+          dc.send(JSON.stringify({ type: "response.create", response: { instructions: confirmText } }));
+        }
+
+        if (name === "update_action") {
+          const argsStr = tc.arguments ?? tc.function?.arguments ?? "{}";
+          let upd: any = {};
+          try { upd = JSON.parse(argsStr); } catch {}
+          const norm = normalizeUpdates(upd?.updates);
+            if (pendingAction && norm && typeof norm === "object" && Object.keys(norm).length) {
+              pendingAction = {
+                ...pendingAction,
+                params: { ...(pendingAction.params || {}), ...norm }
+              };
+            }
+
+          // cerrar el paso del tool
+          dc.send(JSON.stringify({
+            type: "response.tool_output",
+            tool_call_id: tc.id,
+            output: JSON.stringify({ ok: true })
+          }));
+
+          // volver a pedir confirmación con el resumen actualizado
+          lastUserText = ""; 
+          onEvent?.({ kind: "pending_action", data: pendingAction });
           const confirmText = buildConfirmPrompt(pendingAction);
           dc.send(JSON.stringify({
             type: "response.create",
             response: { instructions: confirmText }
           }));
+          continue;
         }
+
         if (name === "confirm_action") {
           const argsStr = tc.arguments ?? tc.function?.arguments ?? "{}";
           let conf: any = {};
           try { conf = JSON.parse(argsStr); } catch {}
-          // merge updates
-          if (pendingAction && conf?.updates && typeof conf.updates === "object") {
-            pendingAction = { ...pendingAction, params: { ...(pendingAction.params||{}), ...conf.updates } };
-          }
-          const confirmed = !!conf?.confirm;
 
+          // 1) aplica updates normalizados (si vinieron en este call)
+          const norm = normalizeUpdates(conf?.updates);
+          if (pendingAction && norm && typeof norm === "object" && Object.keys(norm).length) {
+            pendingAction = {
+              ...pendingAction,
+              params: { ...(pendingAction.params || {}), ...norm }
+            };
+          }
+
+          const confirmed = !!conf?.confirm;
+          const saidConfirm = /\bconfirm(o|ar|a)\b/i.test((lastUserText || ""));
+          const saidModify  = /\b(agrega|añade|cambia|corrige|actualiza|modifica)\b/i.test((lastUserText || ""));
+          const hasUpdates  = !!(conf?.updates && Object.keys(conf.updates || {}).length > 0);
+
+          // 2) si no hubo confirmación explícita o hubo intención/updates, re-pedir confirmación
+          if ((confirmed && !saidConfirm) || saidModify || hasUpdates) {
+            dc.send(JSON.stringify({
+              type: "response.tool_output",
+              tool_call_id: tc.id,
+              output: JSON.stringify({ ok: false, reason: "need_explicit_confirm" })
+            }));
+            lastUserText = "";
+            onEvent?.({ kind: "pending_action", data: pendingAction });
+            const confirmText = buildConfirmPrompt(pendingAction);
+            dc.send(JSON.stringify({ type: "response.create", response: { instructions: confirmText } }));
+            return;
+          }
+
+          // 3) flujo normal
           dc.send(JSON.stringify({
             type: "response.tool_output",
-            tool_call_id: tc.id /* o p.call_id */,
+            tool_call_id: tc.id,
             output: JSON.stringify({ ok: confirmed })
           }));
 
           if (confirmed && pendingAction) {
-            // ← AQUÍ recien notificas a tu app
             onEvent?.({ kind: "action", data: pendingAction });
-
             const doneText = `Listo, ejecutaré ${pendingAction.accion} con: ${JSON.stringify(pendingAction.params)}.`;
             dc.send(JSON.stringify({ type: "response.create", response: { instructions: doneText } }));
             pendingAction = null;
@@ -190,6 +273,8 @@ export async function startRealtimeSession(
             pendingAction = null;
           }
         }
+
+
       }
       return;
     }
@@ -198,10 +283,13 @@ export async function startRealtimeSession(
     if (p.type === "response.function_call_arguments.done") {
       const name = p.name;
       const args = p.arguments ?? "{}";
+
       if (name === "emit_action") {
         let parsed: any = {};
         try { parsed = JSON.parse(args); } catch {}
         pendingAction = parsed;
+        lastUserText = ""; 
+        onEvent?.({ kind: "pending_action", data: pendingAction });
         dc.send(JSON.stringify({
           type: "response.tool_output",
           tool_call_id: p.call_id || p.id,
@@ -211,18 +299,70 @@ export async function startRealtimeSession(
         dc.send(JSON.stringify({ type: "response.create", response: { instructions: confirmText } }));
         return;
       }
+
+      if (name === "update_action") {
+        let upd: any = {};
+        try { upd = JSON.parse(args); } catch {}
+        const raw = upd?.updates;
+        const norm = normalizeUpdates(raw);
+        if (pendingAction && norm && typeof norm === "object" && Object.keys(norm).length) {
+          pendingAction = {
+            ...pendingAction,
+            params: { ...(pendingAction.params || {}), ...norm }
+          };
+        }
+        dc.send(JSON.stringify({
+          type: "response.tool_output",
+          tool_call_id: p.call_id || p.id,
+          output: JSON.stringify({ ok: true })
+        }));
+
+        lastUserText = ""; 
+        onEvent?.({ kind: "pending_action", data: pendingAction });
+        const confirmText = buildConfirmPrompt(pendingAction);
+        dc.send(JSON.stringify({
+          type: "response.create",
+          response: { instructions: confirmText }
+        }));
+        return;
+      }
+
       if (name === "confirm_action") {
         let conf: any = {};
         try { conf = JSON.parse(args); } catch {}
-        if (pendingAction && conf?.updates && typeof conf.updates === "object") {
-          pendingAction = { ...pendingAction, params: { ...(pendingAction.params||{}), ...conf.updates } };
+        const raw = conf?.updates;
+        const norm = normalizeUpdates(raw);
+        if (pendingAction && norm && typeof norm === "object" && Object.keys(norm).length) {
+          pendingAction = {
+            ...pendingAction,
+            params: { ...(pendingAction.params || {}), ...norm }
+          };
         }
-        const confirmed = !!conf?.confirm;
+
+        const confirmed  = !!conf?.confirm;
+        const saidConfirm = /\bconfirm(o|ar|a)\b/i.test((lastUserText || ""));
+        const saidModify  = /\b(agrega|añade|cambia|corrige|actualiza|modifica)\b/i.test((lastUserText || ""));
+        const hasUpdates  = !!(conf?.updates && Object.keys(conf.updates || {}).length > 0);
+
+        if ((confirmed && !saidConfirm) || saidModify || hasUpdates) {
+          dc.send(JSON.stringify({
+            type: "response.tool_output",
+            tool_call_id: p.call_id || p.id,
+            output: JSON.stringify({ ok: false, reason: "need_explicit_confirm" })
+          }));
+          lastUserText = "";
+          onEvent?.({ kind: "pending_action", data: pendingAction });
+          const confirmText = buildConfirmPrompt(pendingAction);
+          dc.send(JSON.stringify({ type:"response.create", response:{ instructions: confirmText }}));
+          return;
+        }
+
         dc.send(JSON.stringify({
           type: "response.tool_output",
           tool_call_id: p.call_id || p.id,
           output: JSON.stringify({ ok: confirmed })
         }));
+
         if (confirmed && pendingAction) {
           onEvent?.({ kind: "action", data: pendingAction });
           const doneText = `Listo, ejecutaré ${pendingAction.accion} con: ${JSON.stringify(pendingAction.params)}.`;
@@ -233,7 +373,6 @@ export async function startRealtimeSession(
           dc.send(JSON.stringify({ type: "response.create", response: { instructions: cancelText } }));
           pendingAction = null;
         }
-        return;
       }
     }
 
@@ -259,8 +398,9 @@ export async function startRealtimeSession(
       onEvent?.({ kind: "partial_text", text: p.text }); return;
     }
     if (p.type === "transcript.done" && p.text) {
+      lastUserText = p.text;
       onEvent?.({ kind: "user_text", text: p.text });
-      return;
+      //return;
     }
 
   };
@@ -346,16 +486,36 @@ export async function startRealtimeSession(
       }
     };
 
+    const updateTool = {
+      type: "function",
+      name: "update_action",
+      description:
+        "Actualiza los campos de la acción pendiente sin confirmarla todavía. " +
+        "Úsalo cuando el usuario diga 'agrega', 'cambia', 'corrige', etc.",
+      parameters: {
+        type: "object",
+        required: ["updates"],
+        properties: {
+          updates: { type: "object", additionalProperties: true }
+        }
+      }
+    };
+
+
     // Instrucciones: SIEMPRE extrae acción, luego solicita confirmación y espera confirm_action
     const systemRules =
-      "1) Extrae la intención y llama al tool 'emit_action'. " +
-      "2) Presenta un RESUMEN breve y PIDE CONFIRMACIÓN explícita: confirmar o cancelar; " +
-      "   sugiere campos opcionales (tipo, precio_unitario, costo_produccion, tiempo_impresion, " +
+      "1) Interpreta la intención y llama SIEMPRE a 'emit_action' primero. " +
+      "2) Presenta un RESUMEN y PIDE CONFIRMACIÓN. " +
+      "3) Si el usuario dice 'agrega', 'cambia', 'corrige', etc.: " +
+      "   llama SOLO a 'update_action' con los 'updates' y vuelve a MOSTRAR el resumen " +
+      "   y a PEDIR CONFIRMACIÓN. " +
+      "4) NO llames 'confirm_action' con confirm:true a menos que el usuario diga " +
+      "   claramente 'confirmo' / 'confirmar'. " +
+      "5) Para cancelar, llama 'confirm_action' con confirm:false. " +
+      "6) Sugiere campos opcionales (tipo, precio_unitario, costo_produccion, tiempo_impresion, " +
       "   stock_alerta, gramos, etiquetas, notas, cliente, productos, proveedor, precio_total, " +
-      "   categoria, fecha, prioridad). " +
-      "3) NO anuncies creación/ejecución ni confirmes la acción hasta recibir 'confirm_action' con confirm=true. " +
-      "4) Si el usuario agrega campos, pasa por 'confirm_action' con 'updates'. " +
-      "Responde en español de MX.";
+      "   categoria, fecha, prioridad). Responde en español de MX.";
+
 
 
     const sessionUpdate = {
@@ -373,7 +533,7 @@ export async function startRealtimeSession(
           create_response: false,
           interrupt_response: true
         },
-        tools: [emitActionTool, confirmTool],
+        tools: [emitActionTool, updateTool, confirmTool],
         tool_choice: "auto"
       }
     };
